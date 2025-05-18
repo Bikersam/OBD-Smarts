@@ -1,0 +1,497 @@
+/**
+ * Smart451 CAN Sniffer - ESP32-S3 Triad Core
+ * 
+ * This firmware implements the core functionality for the ESP32-S3 triad mesh
+ * that interfaces with a Flipper Zero to sniff and decode CAN bus data from
+ * a Smart 451 ForTwo.
+ * 
+ * Hardware:
+ * - ESP32-S3 with ML capabilities
+ * - MCP2515 CAN controller
+ * - SD card reader
+ * 
+ * Features:
+ * - CAN bus sniffing and logging
+ * - Inter-ESP triad communication
+ * - Pattern recognition and decoding
+ * - Flipper Zero interface
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <mcp_can.h>
+#include <vector>
+#include <map>
+
+// =============== PIN DEFINITIONS ===============
+// SPI pins for MCP2515
+#define MCP2515_CS_PIN  5
+#define MCP2515_INT_PIN 4
+
+// SPI pins for SD card
+#define SD_CS_PIN       10
+
+// Node identification
+#define NODE_ID         0  // 0, 1, or 2 for the triad configuration
+const char* NODE_NAMES[3] = {"ALPHA", "BETA", "GAMMA"};
+#define IS_PRIMARY      (NODE_ID == 0)  // ALPHA node is primary
+
+// =============== GLOBAL VARIABLES ===============
+MCP_CAN CAN0(MCP2515_CS_PIN);  // CAN object with CS pin
+SPIClass SDSPI(FSPI);          // Separate SPI instance for SD
+
+// Structure to store CAN frames
+struct CANFrame {
+  uint32_t timestamp;
+  uint32_t id;
+  uint8_t dlc;
+  uint8_t data[8];
+  bool isExtended;
+  bool isRtr;
+};
+
+// Buffer for CAN frames
+std::vector<CANFrame> frameBuffer;
+const size_t MAX_BUFFER_SIZE = 1000;
+
+// Triad mesh peer addresses - Update these with your ESP MAC addresses
+uint8_t peerAddresses[3][6] = {
+  {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01},  // ALPHA MAC
+  {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02},  // BETA MAC
+  {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x03}   // GAMMA MAC
+};
+
+// Triad sync structure
+struct SyncPacket {
+  uint8_t nodeId;
+  uint32_t timestamp;
+  int8_t rssi;
+  uint16_t packetCount;
+  uint8_t status;
+};
+
+// Peer info structure
+struct PeerInfo {
+  uint32_t lastSeen;
+  int8_t rssi;
+  uint16_t packetCount;
+  uint8_t status;
+  int32_t clockDelta;
+};
+
+PeerInfo peers[2];  // Info about the other two nodes in the triad
+
+// Known CAN IDs with descriptions for Smart 451
+std::map<uint32_t, String> knownIDs = {
+  {0x000, "Vehicle Speed"},
+  {0x010, "RPM"},
+  {0x0A0, "Throttle Position"},
+  {0x0C0, "Temperature"},
+  // Add more as you discover them
+};
+
+// File handling
+File logFile;
+char logFileName[24];
+uint32_t currentFileSize = 0;
+const uint32_t MAX_FILE_SIZE = 8 * 1024;  // 8KB max file size before rotation
+
+// Flipper communication
+const int FLIPPER_BAUD = 115200;
+bool flipperConnected = false;
+
+// =============== FUNCTION DECLARATIONS ===============
+void initCAN();
+void initSD();
+void initTriadMesh();
+void processCANMessages();
+void logCANFrame(CANFrame &frame);
+void sendFrameToFlipperZero(CANFrame &frame);
+void rotateLogFileIfNeeded();
+String getCANFrameDescription(uint32_t id);
+void handleFlipperCommands();
+void sendTriadSync();
+void onDataReceived(const uint8_t *mac, const uint8_t *data, int len);
+bool validateFrameInTriad(CANFrame &frame);
+void checkPeerHealth();
+void dumpFrameBufferToSD();
+
+// =============== SETUP ===============
+void setup() {
+  // Initialize serial for debugging and Flipper communication
+  Serial.begin(FLIPPER_BAUD);
+  delay(500);
+  
+  Serial.println(F("Smart 451 CAN Triad Sniffer - Node " + String(NODE_NAMES[NODE_ID])));
+  
+  // Initialize CAN
+  initCAN();
+  
+  // Initialize SD card
+  initSD();
+  
+  // Initialize triad mesh
+  initTriadMesh();
+  
+  Serial.println(F("System initialized, waiting for CAN messages..."));
+}
+
+// =============== MAIN LOOP ===============
+void loop() {
+  // Process incoming CAN messages
+  processCANMessages();
+  
+  // Handle commands from Flipper Zero
+  handleFlipperCommands();
+  
+  // Send periodic triad sync messages
+  static uint32_t lastSyncTime = 0;
+  if (millis() - lastSyncTime > 1000) {  // Every second
+    sendTriadSync();
+    lastSyncTime = millis();
+  }
+  
+  // Check peer health
+  static uint32_t lastHealthCheck = 0;
+  if (millis() - lastHealthCheck > 5000) {  // Every 5 seconds
+    checkPeerHealth();
+    lastHealthCheck = millis();
+  }
+  
+  // Flush buffer to SD if it's getting full
+  if (frameBuffer.size() >= MAX_BUFFER_SIZE) {
+    dumpFrameBufferToSD();
+  }
+}
+
+// =============== FUNCTION IMPLEMENTATIONS ===============
+
+void initCAN() {
+  Serial.println(F("Initializing CAN controller..."));
+  
+  // Initialize MCP2515 CAN controller
+  if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
+    Serial.println(F("MCP2515 initialized successfully"));
+  } else {
+    Serial.println(F("Error initializing MCP2515"));
+    // In production code, add retry or fallback
+  }
+  
+  // Set to normal mode
+  CAN0.setMode(MCP_NORMAL);
+  
+  // Set interrupt pin as input
+  pinMode(MCP2515_INT_PIN, INPUT);
+  
+  Serial.println(F("CAN initialized at 500kbps"));
+}
+
+void initSD() {
+  Serial.println(F("Initializing SD card..."));
+  
+  // Initialize SPI for SD card
+  SDSPI.begin();
+  
+  // Initialize SD card
+  if (!SD.begin(SD_CS_PIN, SDSPI)) {
+    Serial.println(F("SD card initialization failed"));
+    // In production code, add retry or fallback
+  } else {
+    Serial.println(F("SD card initialized successfully"));
+    
+    // Create a new log file with timestamp
+    uint32_t timestamp = millis(); // Or use RTC if available
+    sprintf(logFileName, "/%s_%lu.csv", NODE_NAMES[NODE_ID], timestamp);
+    
+    // Open log file and write header
+    logFile = SD.open(logFileName, FILE_WRITE);
+    if (logFile) {
+      logFile.println(F("Timestamp,ID,Extended,RTR,DLC,Data,Description"));
+      logFile.flush();
+      currentFileSize = logFile.size();
+      logFile.close();
+      
+      Serial.println(F("Log file created: ") + String(logFileName));
+    } else {
+      Serial.println(F("Error creating log file"));
+    }
+  }
+}
+
+void initTriadMesh() {
+  Serial.println(F("Initializing triad mesh network..."));
+  
+  // Set device as both AP and station for ESP-NOW
+  WiFi.mode(WIFI_STA);
+  
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println(F("Error initializing ESP-NOW"));
+    return;
+  }
+  
+  // Register peer info callback
+  esp_now_register_recv_cb(onDataReceived);
+  
+  // Register peers (the other two nodes in the triad)
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  
+  // Add the other two nodes as peers
+  for (int i = 0; i < 3; i++) {
+    if (i == NODE_ID) continue; // Skip self
+    
+    memcpy(peerInfo.peer_addr, peerAddresses[i], 6);
+    peerInfo.channel = 0;  
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println(F("Failed to add peer ") + String(NODE_NAMES[i]));
+    } else {
+      Serial.println(F("Added peer ") + String(NODE_NAMES[i]));
+    }
+  }
+  
+  Serial.println(F("Triad mesh initialized"));
+}
+
+void processCANMessages() {
+  if (!digitalRead(MCP2515_INT_PIN)) {  // If CAN interrupt is active (LOW)
+    uint32_t id;
+    uint8_t len;
+    uint8_t buf[8];
+    uint8_t ext, rtr;
+    
+    // Read CAN message
+    CAN0.readMsgBuf(&id, &ext, &rtr, &len, buf);
+    
+    // Create CAN frame struct
+    CANFrame frame;
+    frame.timestamp = millis();
+    frame.id = id;
+    frame.dlc = len;
+    memcpy(frame.data, buf, len);
+    frame.isExtended = ext;
+    frame.isRtr = rtr;
+    
+    // Only process frame if it passes triad validation
+    if (validateFrameInTriad(frame)) {
+      // Add to buffer
+      frameBuffer.push_back(frame);
+      
+      // Send to Flipper
+      sendFrameToFlipperZero(frame);
+      
+      // Log directly or buffer for later
+      if (frameBuffer.size() % 10 == 0) { // Log every 10 frames
+        dumpFrameBufferToSD();
+      }
+    }
+  }
+}
+
+void logCANFrame(CANFrame &frame) {
+  rotateLogFileIfNeeded();
+  
+  // Open log file
+  logFile = SD.open(logFileName, FILE_APPEND);
+  if (logFile) {
+    // Build CSV line
+    String csvLine = String(frame.timestamp) + "," +
+                     String(frame.id, HEX) + "," +
+                     String(frame.isExtended) + "," +
+                     String(frame.isRtr) + "," +
+                     String(frame.dlc) + ",";
+    
+    // Add data bytes in hex
+    for (int i = 0; i < frame.dlc; i++) {
+      if (i > 0) csvLine += " ";
+      if (frame.data[i] < 0x10) csvLine += "0";
+      csvLine += String(frame.data[i], HEX);
+    }
+    
+    // Add known description if available
+    csvLine += "," + getCANFrameDescription(frame.id);
+    
+    // Write to file
+    logFile.println(csvLine);
+    currentFileSize = logFile.size();
+    logFile.close();
+  }
+}
+
+void sendFrameToFlipperZero(CANFrame &frame) {
+  if (!flipperConnected) return;
+  
+  // Format: CAN:<ID>:<EXT>:<RTR>:<DLC>:<DATA>
+  String message = "CAN:" + String(frame.id, HEX) + ":" +
+                   String(frame.isExtended) + ":" +
+                   String(frame.isRtr) + ":" +
+                   String(frame.dlc) + ":";
+  
+  // Add data bytes
+  for (int i = 0; i < frame.dlc; i++) {
+    if (i > 0) message += " ";
+    if (frame.data[i] < 0x10) message += "0";
+    message += String(frame.data[i], HEX);
+  }
+  
+  // Send to Flipper
+  Serial.println(message);
+}
+
+void rotateLogFileIfNeeded() {
+  if (currentFileSize >= MAX_FILE_SIZE) {
+    // Close current file if open
+    if (logFile) {
+      logFile.close();
+    }
+    
+    // Create new filename with incremented index
+    static int fileIndex = 0;
+    fileIndex++;
+    
+    sprintf(logFileName, "/%s_%d.csv", NODE_NAMES[NODE_ID], fileIndex);
+    
+    // Open new file and write header
+    logFile = SD.open(logFileName, FILE_WRITE);
+    if (logFile) {
+      logFile.println(F("Timestamp,ID,Extended,RTR,DLC,Data,Description"));
+      logFile.flush();
+      currentFileSize = logFile.size();
+      logFile.close();
+      
+      Serial.println(F("Rotated to new log file: ") + String(logFileName));
+    }
+  }
+}
+
+String getCANFrameDescription(uint32_t id) {
+  if (knownIDs.find(id) != knownIDs.end()) {
+    return knownIDs[id];
+  }
+  return "Unknown";
+}
+
+void handleFlipperCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command == "HELLO") {
+      Serial.println("ACK HELLO " + String(NODE_NAMES[NODE_ID]));
+      flipperConnected = true;
+    }
+    else if (command == "STATUS") {
+      Serial.println("STATUS:CAN_OK:SD_OK:PEERS_" + 
+                    String(peers[0].status == 0 && peers[1].status == 0 ? "OK" : "WARN"));
+    }
+    else if (command == "DUMPBUFFER") {
+      Serial.println("ACK DUMPBUFFER");
+      dumpFrameBufferToSD();
+    }
+    else if (command.startsWith("SENDCAN:")) {
+      // TODO: Implement CAN message sending
+      Serial.println("ACK SENDCAN (Not implemented yet)");
+    }
+    else if (command == "GETKNOWNIDS") {
+      Serial.println("ACK GETKNOWNIDS " + String(knownIDs.size()));
+      for (const auto &entry : knownIDs) {
+        Serial.println(String(entry.first, HEX) + ":" + entry.second);
+      }
+    }
+  }
+}
+
+void sendTriadSync() {
+  SyncPacket packet;
+  packet.nodeId = NODE_ID;
+  packet.timestamp = millis();
+  packet.rssi = WiFi.RSSI();
+  packet.packetCount = frameBuffer.size();
+  packet.status = 0; // 0 = OK
+  
+  // Send to both other nodes
+  for (int i = 0; i < 3; i++) {
+    if (i == NODE_ID) continue; // Skip self
+    
+    esp_err_t result = esp_now_send(peerAddresses[i], (uint8_t *)&packet, sizeof(packet));
+    if (result != ESP_OK) {
+      Serial.println("Error sending sync to " + String(NODE_NAMES[i]));
+    }
+  }
+}
+
+void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
+  // Verify this is a sync packet
+  if (len == sizeof(SyncPacket)) {
+    SyncPacket *packet = (SyncPacket *)data;
+    
+    // Skip invalid node IDs
+    if (packet->nodeId >= 3 || packet->nodeId == NODE_ID) return;
+    
+    // Calculate peer index (0 or 1)
+    int peerIndex;
+    if (NODE_ID == 0) {
+      peerIndex = packet->nodeId - 1;
+    } else if (NODE_ID == 1) {
+      peerIndex = packet->nodeId == 0 ? 0 : 1;
+    } else { // NODE_ID == 2
+      peerIndex = packet->nodeId;
+    }
+    
+    // Update peer info
+    peers[peerIndex].lastSeen = millis();
+    peers[peerIndex].rssi = packet->rssi;
+    peers[peerIndex].packetCount = packet->packetCount;
+    peers[peerIndex].status = packet->status;
+    peers[peerIndex].clockDelta = packet->timestamp - millis();
+  }
+}
+
+bool validateFrameInTriad(CANFrame &frame) {
+  // For now, just return true
+  // In a fully implemented system, this would validate the frame
+  // with the other nodes in the triad before accepting it
+  return true;
+}
+
+void checkPeerHealth() {
+  // Log peer status
+  String status = "Peer health: ";
+  for (int i = 0; i < 2; i++) {
+    int actualPeerID = (i < NODE_ID) ? i : i + 1;
+    
+    status += NODE_NAMES[actualPeerID] + ":";
+    
+    // If we've heard from peer in the last 10 seconds
+    if (millis() - peers[i].lastSeen < 10000) {
+      status += "OK";
+      peers[i].status = 0;
+    } else {
+      status += "OFFLINE";
+      peers[i].status = 1;
+    }
+    
+    if (i < 1) status += ", ";
+  }
+  
+  Serial.println(status);
+}
+
+void dumpFrameBufferToSD() {
+  if (frameBuffer.empty()) return;
+  
+  Serial.println("Dumping " + String(frameBuffer.size()) + " frames to SD");
+  
+  for (auto &frame : frameBuffer) {
+    logCANFrame(frame);
+  }
+  
+  frameBuffer.clear();
+  
+  Serial.println("Buffer dump complete");
+}

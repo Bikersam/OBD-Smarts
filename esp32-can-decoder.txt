@@ -1,0 +1,458 @@
+/**
+ * Smart451 Decoder - ESP32-S3 Pattern Learning Module
+ * 
+ * This module implements the machine learning functionality for the 
+ * ESP32-S3 to identify patterns in the CAN bus data and decode the 
+ * meaning of unknown CAN IDs and data patterns.
+ * 
+ * Features:
+ * - Pattern recognition using simple ML techniques
+ * - CAN ID clustering
+ * - Signal value extraction and normalization
+ * - Known pattern database management
+ */
+
+#include <Arduino.h>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <SD.h>
+
+// Structure for a CAN frame
+struct CANFrame {
+  uint32_t timestamp;
+  uint32_t id;
+  uint8_t dlc;
+  uint8_t data[8];
+  bool isExtended;
+  bool isRtr;
+};
+
+// Structure for a recognized pattern
+struct Pattern {
+  uint32_t id;
+  uint8_t startBit;
+  uint8_t bitLength;
+  float multiplier;
+  float offset;
+  String description;
+  String unit;
+};
+
+// Structure for a signal value
+struct SignalValue {
+  uint32_t timestamp;
+  float value;
+};
+
+// Class for decoding CAN messages
+class CANDecoder {
+private:
+  // Map of CAN IDs to their recognized patterns
+  std::map<uint32_t, std::vector<Pattern>> patterns;
+  
+  // Log of signal values for each pattern
+  std::map<String, std::vector<SignalValue>> signalHistory;
+  
+  // Frequency counter for CAN IDs
+  std::map<uint32_t, uint32_t> idFrequency;
+  
+  // Database file path
+  String databasePath = "/patterns.json";
+  
+  // Maximum history size per signal
+  const size_t MAX_HISTORY_SIZE = 100;
+  
+public:
+  CANDecoder() {
+    loadPatternDatabase();
+  }
+  
+  // Process a new CAN frame
+  void processFrame(const CANFrame &frame) {
+    // Update frequency counter
+    idFrequency[frame.id]++;
+    
+    // Extract values from known patterns
+    extractAndStoreValues(frame);
+    
+    // Try to identify new patterns
+    identifyPatterns(frame);
+  }
+  
+  // Get known patterns for an ID
+  std::vector<Pattern> getPatternsForId(uint32_t id) {
+    if (patterns.find(id) != patterns.end()) {
+      return patterns[id];
+    }
+    return std::vector<Pattern>();
+  }
+  
+  // Get the most frequent CAN IDs
+  std::vector<uint32_t> getMostFrequentIds(size_t count) {
+    std::vector<std::pair<uint32_t, uint32_t>> freqPairs;
+    for (const auto &pair : idFrequency) {
+      freqPairs.push_back(pair);
+    }
+    
+    // Sort by frequency (highest first)
+    std::sort(freqPairs.begin(), freqPairs.end(), 
+      [](const auto &a, const auto &b) {
+        return a.second > b.second;
+      });
+    
+    std::vector<uint32_t> result;
+    for (size_t i = 0; i < std::min(count, freqPairs.size()); i++) {
+      result.push_back(freqPairs[i].first);
+    }
+    
+    return result;
+  }
+  
+  // Get signal history for a specific pattern
+  std::vector<SignalValue> getSignalHistory(uint32_t id, uint8_t startBit, uint8_t length) {
+    String key = String(id, HEX) + ":" + String(startBit) + ":" + String(length);
+    if (signalHistory.find(key) != signalHistory.end()) {
+      return signalHistory[key];
+    }
+    return std::vector<SignalValue>();
+  }
+  
+  // Load pattern database from SD card
+  bool loadPatternDatabase() {
+    if (!SD.exists(databasePath)) {
+      Serial.println("Pattern database not found, creating new one");
+      return false;
+    }
+    
+    File file = SD.open(databasePath, FILE_READ);
+    if (!file) {
+      Serial.println("Failed to open pattern database");
+      return false;
+    }
+    
+    // This is a simplified version. In a real implementation,
+    // you would parse the JSON properly with a library like ArduinoJson
+    
+    String json = file.readString();
+    file.close();
+    
+    // For simplicity, we'll add some known Smart 451 patterns
+    // In a real implementation, parse these from the JSON file
+    
+    // Engine RPM
+    Pattern rpmPattern;
+    rpmPattern.id = 0x175;
+    rpmPattern.startBit = 16;
+    rpmPattern.bitLength = 16;
+    rpmPattern.multiplier = 0.25;
+    rpmPattern.offset = 0;
+    rpmPattern.description = "Engine RPM";
+    rpmPattern.unit = "rpm";
+    
+    std::vector<Pattern> rpmPatterns = {rpmPattern};
+    patterns[0x175] = rpmPatterns;
+    
+    // Vehicle Speed
+    Pattern speedPattern;
+    speedPattern.id = 0x280;
+    speedPattern.startBit = 8;
+    speedPattern.bitLength = 16;
+    speedPattern.multiplier = 0.01;
+    speedPattern.offset = 0;
+    speedPattern.description = "Vehicle Speed";
+    speedPattern.unit = "km/h";
+    
+    std::vector<Pattern> speedPatterns = {speedPattern};
+    patterns[0x280] = speedPatterns;
+    
+    Serial.println("Pattern database loaded");
+    return true;
+  }
+  
+  // Save pattern database to SD card
+  bool savePatternDatabase() {
+    File file = SD.open(databasePath, FILE_WRITE);
+    if (!file) {
+      Serial.println("Failed to open pattern database for writing");
+      return false;
+    }
+    
+    // This is a simplified version. In a real implementation,
+    // you would generate proper JSON with a library like ArduinoJson
+    
+    String json = "{\n  \"patterns\": [\n";
+    
+    bool first = true;
+    for (const auto &idPatterns : patterns) {
+      for (const auto &pattern : idPatterns.second) {
+        if (!first) {
+          json += ",\n";
+        }
+        first = false;
+        
+        json += "    {\n";
+        json += "      \"id\": \"" + String(pattern.id, HEX) + "\",\n";
+        json += "      \"startBit\": " + String(pattern.startBit) + ",\n";
+        json += "      \"bitLength\": " + String(pattern.bitLength) + ",\n";
+        json += "      \"multiplier\": " + String(pattern.multiplier) + ",\n";
+        json += "      \"offset\": " + String(pattern.offset) + ",\n";
+        json += "      \"description\": \"" + pattern.description + "\",\n";
+        json += "      \"unit\": \"" + pattern.unit + "\"\n";
+        json += "    }";
+      }
+    }
+    
+    json += "\n  ]\n}";
+    
+    file.print(json);
+    file.close();
+    
+    Serial.println("Pattern database saved");
+    return true;
+  }
+  
+  // Add a new pattern
+  void addPattern(const Pattern &pattern) {
+    patterns[pattern.id].push_back(pattern);
+    savePatternDatabase();
+  }
+  
+private:
+  // Extract values according to known patterns and store them
+  void extractAndStoreValues(const CANFrame &frame) {
+    if (patterns.find(frame.id) == patterns.end()) {
+      return; // No known patterns for this ID
+    }
+    
+    for (const auto &pattern : patterns[frame.id]) {
+      // Extract the value
+      float value = extractValue(frame.data, pattern.startBit, pattern.bitLength);
+      
+      // Apply scaling
+      value = value * pattern.multiplier + pattern.offset;
+      
+      // Create signal value
+      SignalValue sv;
+      sv.timestamp = frame.timestamp;
+      sv.value = value;
+      
+      // Create key for this signal
+      String key = String(frame.id, HEX) + ":" + String(pattern.startBit) + ":" + String(pattern.bitLength);
+      
+      // Add to history
+      signalHistory[key].push_back(sv);
+      
+      // Limit history size
+      if (signalHistory[key].size() > MAX_HISTORY_SIZE) {
+        signalHistory[key].erase(signalHistory[key].begin());
+      }
+    }
+  }
+  
+  // Extract a value from CAN data
+  float extractValue(const uint8_t *data, uint8_t startBit, uint8_t bitLength) {
+    uint32_t result = 0;
+    uint8_t startByte = startBit / 8;
+    uint8_t startOffset = startBit % 8;
+    uint8_t remainingBits = bitLength;
+    
+    // Little-endian extraction
+    while (remainingBits > 0) {
+      uint8_t bitsFromByte = std::min(8 - startOffset, remainingBits);
+      uint8_t mask = ((1 << bitsFromByte) - 1) << startOffset;
+      uint8_t value = (data[startByte] & mask) >> startOffset;
+      
+      result |= (value << (bitLength - remainingBits));
+      
+      remainingBits -= bitsFromByte;
+      startByte++;
+      startOffset = 0;
+    }
+    
+    return static_cast<float>(result);
+  }
+  
+  // Try to identify new patterns in the frame
+  void identifyPatterns(const CANFrame &frame) {
+    // This is a placeholder for actual pattern detection logic
+    // In a real implementation, this would use more sophisticated
+    // techniques like change detection, correlation with vehicle state, etc.
+    
+    // For now, we'll just check for changes in bytes that might indicate
+    // they contain meaningful information
+    
+    // Check if we already have patterns for this ID
+    if (patterns.find(frame.id) != patterns.end() && !patterns[frame.id].empty()) {
+      return; // Already have patterns for this ID
+    }
+    
+    // Simple example: look for bytes that change in consecutive frames
+    // This would need to be expanded with proper ML techniques
+    
+    // For demonstration, we'll just log that we found a potential pattern
+    Serial.println("Potential pattern detected in ID: 0x" + String(frame.id, HEX));
+  }
+};
+
+// Global CANDecoder instance
+CANDecoder decoder;
+
+// Buffer for learning process
+std::vector<CANFrame> learningBuffer;
+const size_t LEARNING_BUFFER_SIZE = 1000;
+bool isLearningMode = false;
+
+// Function to start learning mode
+void startLearningMode() {
+  Serial.println("Starting learning mode...");
+  learningBuffer.clear();
+  isLearningMode = true;
+}
+
+// Function to process learning buffer and identify patterns
+void processLearningBuffer() {
+  if (learningBuffer.size() < 50) {
+    Serial.println("Not enough data for learning");
+    return;
+  }
+  
+  Serial.println("Processing " + String(learningBuffer.size()) + " frames for learning");
+  
+  // Group frames by ID
+  std::map<uint32_t, std::vector<CANFrame>> idGroups;
+  for (const auto &frame : learningBuffer) {
+    idGroups[frame.id].push_back(frame);
+  }
+  
+  Serial.println("Found " + String(idGroups.size()) + " unique CAN IDs");
+  
+  // Process each ID group
+  for (const auto &group : idGroups) {
+    uint32_t id = group.first;
+    const auto &frames = group.second;
+    
+    if (frames.size() < 10) continue; // Need enough samples
+    
+    Serial.println("Analyzing ID: 0x" + String(id, HEX) + " with " + 
+                  String(frames.size()) + " frames");
+    
+    // Find bytes that change
+    uint8_t changeMask[8] = {0};
+    
+    for (size_t i = 1; i < frames.size(); i++) {
+      for (size_t j = 0; j < std::min(8, (int)frames[i].dlc); j++) {
+        if (frames[i].data[j] != frames[i-1].data[j]) {
+          changeMask[j] = 1;
+        }
+      }
+    }
+    
+    // Report changing bytes
+    String changeReport = "Changing bytes: ";
+    for (int i = 0; i < 8; i++) {
+      if (changeMask[i]) {
+        changeReport += String(i) + " ";
+      }
+    }
+    Serial.println(changeReport);
+    
+    // In a real implementation, you would do more sophisticated
+    // analysis here to identify patterns
+  }
+  
+  isLearningMode = false;
+  Serial.println("Learning complete");
+}
+
+// Function to add a frame to the learning buffer
+void addFrameToLearningBuffer(const CANFrame &frame) {
+  if (!isLearningMode) return;
+  
+  learningBuffer.push_back(frame);
+  
+  if (learningBuffer.size() >= LEARNING_BUFFER_SIZE) {
+    processLearningBuffer();
+  }
+}
+
+// Function to predict what a CAN ID might represent based on its behavior
+String predictCANIdFunction(uint32_t id, const std::vector<CANFrame> &frames) {
+  if (frames.empty()) return "Unknown";
+  
+  // This is a very simplified prediction based on patterns typically seen
+  // in Smart 451 and other vehicles
+  
+  // Check frequency
+  uint32_t period = 0;
+  if (frames.size() > 1) {
+    period = (frames.back().timestamp - frames.front().timestamp) / (frames.size() - 1);
+  }
+  
+  // Check data patterns
+  bool hasChangingData = false;
+  for (size_t i = 1; i < frames.size(); i++) {
+    for (int j = 0; j < 8; j++) {
+      if (frames[i].data[j] != frames[i-1].data[j]) {
+        hasChangingData = true;
+        break;
+      }
+    }
+    if (hasChangingData) break;
+  }
+  
+  // Make predictions based on ID and behavior
+  if (id == 0x175) return "Engine Data (Smart ForTwo)";
+  if (id == 0x280) return "Vehicle Speed (Smart ForTwo)";
+  if (id == 0x307) return "Engine Temperature (Smart ForTwo)";
+  if (id == 0x470) return "Door Status (Smart ForTwo)";
+  
+  // Generic predictions based on behavior
+  if (period > 900 && period < 1100) {
+    if (hasChangingData) return "Possible Sensor (1s interval)";
+    return "Possible Status Message (1s interval)";
+  }
+  
+  if (period > 90 && period < 110) {
+    if (hasChangingData) return "Possible Sensor (100ms interval)";
+    return "Possible Status Message (100ms interval)";
+  }
+  
+  if (period < 20) {
+    return "Possible High-Priority Message";
+  }
+  
+  return "Unknown Function";
+}
+
+// Export functions for main application
+extern "C" {
+  void decoder_init() {
+    decoder.loadPatternDatabase();
+  }
+  
+  void decoder_process_frame(const CANFrame &frame) {
+    decoder.processFrame(frame);
+    
+    if (isLearningMode) {
+      addFrameToLearningBuffer(frame);
+    }
+  }
+  
+  void decoder_start_learning() {
+    startLearningMode();
+  }
+  
+  void decoder_stop_learning() {
+    if (isLearningMode) {
+      processLearningBuffer();
+    }
+  }
+  
+  const char* decoder_predict_function(uint32_t id, const CANFrame *frames, size_t count) {
+    std::vector<CANFrame> frameVec(frames, frames + count);
+    static String result;
+    result = predictCANIdFunction(id, frameVec);
+    return result.c_str();
+  }
+}

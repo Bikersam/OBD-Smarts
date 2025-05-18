@@ -1,0 +1,500 @@
+/**
+ * ESP32-S3 Triad LC Tuning Module
+ * 
+ * This module implements the LC tank tuning functionality for
+ * the ESP32-S3 triad mesh to optimize communication between nodes
+ * and with the CAN bus.
+ * 
+ * Features:
+ * - Phase coherence monitoring
+ * - Signal quality assessment
+ * - Tuning guidance via PWM tone output
+ * - Triad harmony status reporting
+ */
+
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+// =============== PIN DEFINITIONS ===============
+#define PWM_TUNING_OUT_PIN   18  // PWM pin for tuning tone
+#define LED_INDICATOR_PIN    2   // Built-in LED for visual feedback
+
+// =============== TUNING CONSTANTS ===============
+#define TONE_BASE_FREQ        440   // Base frequency for tuning tone (A4)
+#define TONE_MAX_FREQ         880   // Max frequency (A5)
+#define TONE_MIN_FREQ         220   // Min frequency (A3)
+
+#define RSSI_OPTIMAL         -55    // Optimal RSSI value
+#define RSSI_ACCEPTABLE      -70    // Acceptable RSSI threshold
+#define RSSI_POOR            -80    // Poor signal threshold
+
+#define PACKET_LOSS_GOOD      0.05  // Good packet loss rate (5%)
+#define PACKET_LOSS_ACCEPTABLE 0.10 // Acceptable packet loss rate (10%)
+
+#define PHASE_LOCK_TOLERANCE  10    // Phase lock tolerance in ms
+
+// =============== TUNING STRUCTURES ===============
+
+// Structure for phase monitoring
+struct PhaseVector {
+  uint8_t peerId;
+  int8_t rssi;
+  int32_t clockDelta;
+  uint32_t lastSeenTs;
+  uint16_t packetsSent;
+  uint16_t packetsReceived;
+  float packetLoss;
+  bool isLocked;
+};
+
+// Structure for LC tank tuning
+struct LCTankTuning {
+  uint8_t peerIndex;          // Which peer this tank connects to
+  bool isHighSide;            // High-side (Vcc) or low-side (GND) tank
+  float resonanceQuality;     // Quality of resonance (0.0-1.0)
+  int8_t tuningDirection;     // -1: reduce, 0: optimal, 1: increase
+  uint32_t lastAdjustmentTs;  // When last adjustment was made
+};
+
+// Structure for triad harmony status
+struct TriadHarmony {
+  bool isHarmonized;
+  uint8_t harmonizationLevel;  // 0-100
+  uint32_t stableHarmonicsSince;
+  uint8_t activeNodes;
+};
+
+// =============== GLOBAL VARIABLES ===============
+PhaseVector peers[2];            // Phase data for the two peer ESP32s
+LCTankTuning lcTanks[4];         // 4 LC tanks (2 high, 2 low for two peers)
+TriadHarmony harmonyStatus;      // Triad harmony status
+
+// Node identification (from main)
+extern uint8_t NODE_ID;
+extern const char* NODE_NAMES[];
+
+// PWM properties
+uint8_t pwmChannel = 0;
+uint8_t pwmResolution = 8;
+uint32_t pwmFrequency = TONE_BASE_FREQ;
+
+// =============== FUNCTION DECLARATIONS ===============
+void initTuningModule();
+void updatePeerPhase(uint8_t peerId, int8_t rssi, int32_t clockDelta);
+void updatePacketStats(uint8_t peerId, bool received);
+float calculateResonanceQuality(uint8_t peerIndex);
+void updateTuningTone();
+void updateLEDStatus();
+void reportHarmonyStatus();
+bool isTriadHarmonized();
+String getLCTankTuningInstruction(uint8_t tankIndex);
+void evaluateLCTanks();
+
+// =============== FUNCTION IMPLEMENTATIONS ===============
+
+void initTuningModule() {
+  Serial.println(F("Initializing LC Tank Tuning Module..."));
+  
+  // Initialize PWM for tuning tone
+  ledcSetup(pwmChannel, pwmFrequency, pwmResolution);
+  ledcAttachPin(PWM_TUNING_OUT_PIN, pwmChannel);
+  
+  // Initialize LED pin
+  pinMode(LED_INDICATOR_PIN, OUTPUT);
+  
+  // Initialize peer phase vectors
+  for (int i = 0; i < 2; i++) {
+    peers[i].peerId = (NODE_ID + i + 1) % 3;  // Calculate peer IDs
+    peers[i].rssi = -100;                      // Initial poor RSSI
+    peers[i].clockDelta = 1000;                // Initial large clock delta
+    peers[i].lastSeenTs = 0;
+    peers[i].packetsSent = 0;
+    peers[i].packetsReceived = 0;
+    peers[i].packetLoss = 1.0;                 // Initial 100% packet loss
+    peers[i].isLocked = false;
+  }
+  
+  // Initialize LC tanks (2 per peer * 2 peers = 4 tanks)
+  for (int i = 0; i < 4; i++) {
+    lcTanks[i].peerIndex = i / 2;              // Tanks 0-1 for peer 0, 2-3 for peer 1
+    lcTanks[i].isHighSide = i % 2 == 0;        // Even indices are high-side tanks
+    lcTanks[i].resonanceQuality = 0.0;
+    lcTanks[i].tuningDirection = 0;
+    lcTanks[i].lastAdjustmentTs = 0;
+  }
+  
+  // Initialize harmony status
+  harmonyStatus.isHarmonized = false;
+  harmonyStatus.harmonizationLevel = 0;
+  harmonyStatus.stableHarmonicsSince = 0;
+  harmonyStatus.activeNodes = 1;  // Self is active
+  
+  Serial.println(F("Tuning Module Initialized"));
+}
+
+void updatePeerPhase(uint8_t peerId, int8_t rssi, int32_t clockDelta) {
+  // Find the correct peer index
+  int peerIndex = -1;
+  for (int i = 0; i < 2; i++) {
+    if (peers[i].peerId == peerId) {
+      peerIndex = i;
+      break;
+    }
+  }
+  
+  if (peerIndex == -1) return;  // Invalid peer
+  
+  // Update phase information
+  peers[peerIndex].rssi = rssi;
+  peers[peerIndex].clockDelta = clockDelta;
+  peers[peerIndex].lastSeenTs = millis();
+  
+  // Update packet stats
+  updatePacketStats(peerId, true);
+  
+  // Check if phase is locked
+  peers[peerIndex].isLocked = (abs(clockDelta) < PHASE_LOCK_TOLERANCE);
+  
+  // Recalculate resonance quality
+  lcTanks[peerIndex*2].resonanceQuality = calculateResonanceQuality(peerIndex);
+  lcTanks[peerIndex*2+1].resonanceQuality = calculateResonanceQuality(peerIndex);
+  
+  // Update visual and audio feedback
+  updateTuningTone();
+  updateLEDStatus();
+  
+  // Evaluate LC tanks for tuning instructions
+  evaluateLCTanks();
+  
+  // Check triad harmony status
+  if (isTriadHarmonized() && !harmonyStatus.isHarmonized) {
+    harmonyStatus.isHarmonized = true;
+    harmonyStatus.stableHarmonicsSince = millis();
+    reportHarmonyStatus();
+  } else if (!isTriadHarmonized() && harmonyStatus.isHarmonized) {
+    harmonyStatus.isHarmonized = false;
+    reportHarmonyStatus();
+  }
+}
+
+void updatePacketStats(uint8_t peerId, bool received) {
+  // Find the correct peer index
+  int peerIndex = -1;
+  for (int i = 0; i < 2; i++) {
+    if (peers[i].peerId == peerId) {
+      peerIndex = i;
+      break;
+    }
+  }
+  
+  if (peerIndex == -1) return;  // Invalid peer
+  
+  // Update statistics
+  peers[peerIndex].packetsSent++;
+  if (received) {
+    peers[peerIndex].packetsReceived++;
+  }
+  
+  // Calculate packet loss rate (over the last 100 packets)
+  if (peers[peerIndex].packetsSent >= 10) {
+    peers[peerIndex].packetLoss = 1.0 - 
+      (float)peers[peerIndex].packetsReceived / (float)peers[peerIndex].packetsSent;
+      
+    // Reset counters after a while to get current performance
+    if (peers[peerIndex].packetsSent > 100) {
+      peers[peerIndex].packetsSent = peers[peerIndex].packetsSent * 0.8;
+      peers[peerIndex].packetsReceived = peers[peerIndex].packetsReceived * 0.8;
+    }
+  }
+}
+
+float calculateResonanceQuality(uint8_t peerIndex) {
+  if (peerIndex >= 2) return 0.0;
+  
+  // Calculate quality based on RSSI, packet loss, and clock delta
+  float rssiQuality = 0.0;
+  if (peers[peerIndex].rssi >= RSSI_OPTIMAL) {
+    rssiQuality = 1.0;
+  } else if (peers[peerIndex].rssi >= RSSI_ACCEPTABLE) {
+    rssiQuality = 0.7;
+  } else if (peers[peerIndex].rssi >= RSSI_POOR) {
+    rssiQuality = 0.3;
+  }
+  
+  float packetLossQuality = 0.0;
+  if (peers[peerIndex].packetLoss <= PACKET_LOSS_GOOD) {
+    packetLossQuality = 1.0;
+  } else if (peers[peerIndex].packetLoss <= PACKET_LOSS_ACCEPTABLE) {
+    packetLossQuality = 0.7;
+  } else {
+    packetLossQuality = 0.3 * (1.0 - peers[peerIndex].packetLoss);
+  }
+  
+  float deltaQuality = 0.0;
+  if (abs(peers[peerIndex].clockDelta) < PHASE_LOCK_TOLERANCE) {
+    deltaQuality = 1.0;
+  } else {
+    deltaQuality = 1.0 / (1.0 + (abs(peers[peerIndex].clockDelta) / 50.0));
+  }
+  
+  // Age of last seen packet
+  float freshnessQuality = 0.0;
+  uint32_t age = millis() - peers[peerIndex].lastSeenTs;
+  if (age < 2000) {  // Within 2 seconds
+    freshnessQuality = 1.0;
+  } else if (age < 5000) {  // Within 5 seconds
+    freshnessQuality = 0.5;
+  }
+  
+  // Return weighted average
+  return (rssiQuality * 0.3) + (packetLossQuality * 0.3) + 
+         (deltaQuality * 0.2) + (freshnessQuality * 0.2);
+}
+
+void updateTuningTone() {
+  // Calculate overall resonance quality
+  float totalQuality = 0.0;
+  int activeTanks = 0;
+  
+  for (int i = 0; i < 4; i++) {
+    if (lcTanks[i].resonanceQuality > 0.0) {
+      totalQuality += lcTanks[i].resonanceQuality;
+      activeTanks++;
+    }
+  }
+  
+  // Average quality
+  float avgQuality = (activeTanks > 0) ? (totalQuality / activeTanks) : 0.0;
+  
+  // Map quality to frequency
+  uint32_t newFreq;
+  if (avgQuality >= 0.9) {
+    // Solid tone at base frequency indicates optimal tuning
+    newFreq = TONE_BASE_FREQ;
+  } else {
+    // Lower quality = lower frequency
+    newFreq = TONE_MIN_FREQ + (avgQuality * (TONE_MAX_FREQ - TONE_MIN_FREQ));
+  }
+  
+  // Update PWM frequency if it has changed
+  if (newFreq != pwmFrequency) {
+    pwmFrequency = newFreq;
+    ledcChangeFrequency(pwmChannel, pwmFrequency, pwmResolution);
+  }
+  
+  // Turn on tone if there's an active peer
+  if (activeTanks > 0) {
+    ledcWrite(pwmChannel, 128);  // 50% duty cycle
+  } else {
+    ledcWrite(pwmChannel, 0);    // Off
+  }
+}
+
+void updateLEDStatus() {
+  // Calculate harmony level (0-100)
+  uint8_t harmonyLevel = 0;
+  if (peers[0].isLocked) harmonyLevel += 33;
+  if (peers[1].isLocked) harmonyLevel += 33;
+  if (harmonyStatus.isHarmonized) harmonyLevel += 34;
+  
+  harmonyStatus.harmonizationLevel = harmonyLevel;
+  
+  // Update active nodes count
+  harmonyStatus.activeNodes = 1;  // Self
+  for (int i = 0; i < 2; i++) {
+    if (millis() - peers[i].lastSeenTs < 10000) {  // If seen in the last 10 seconds
+      harmonyStatus.activeNodes++;
+    }
+  }
+  
+  // LED: Blink rate indicates harmony level
+  static uint32_t lastLedToggle = 0;
+  static bool ledState = false;
+  
+  uint32_t currentMillis = millis();
+  uint32_t blinkInterval;
+  
+  if (harmonyLevel >= 90) {
+    // Solid on - high harmony
+    digitalWrite(LED_INDICATOR_PIN, HIGH);
+    ledState = true;
+  } else if (harmonyLevel >= 50) {
+    // Medium blink - medium harmony
+    blinkInterval = 500;
+    if (currentMillis - lastLedToggle >= blinkInterval) {
+      ledState = !ledState;
+      digitalWrite(LED_INDICATOR_PIN, ledState ? HIGH : LOW);
+      lastLedToggle = currentMillis;
+    }
+  } else {
+    // Fast blink - low harmony
+    blinkInterval = 100;
+    if (currentMillis - lastLedToggle >= blinkInterval) {
+      ledState = !ledState;
+      digitalWrite(LED_INDICATOR_PIN, ledState ? HIGH : LOW);
+      lastLedToggle = currentMillis;
+    }
+  }
+}
+
+bool isTriadHarmonized() {
+  // Check if both peer connections are phase-locked
+  bool allPeersLocked = true;
+  for (int i = 0; i < 2; i++) {
+    if (!peers[i].isLocked) {
+      allPeersLocked = false;
+      break;
+    }
+  }
+  
+  // Check if all active peer connections have good resonance
+  bool allResonanceGood = true;
+  for (int i = 0; i < 4; i++) {
+    if (lcTanks[i].resonanceQuality < 0.8) {
+      allResonanceGood = false;
+      break;
+    }
+  }
+  
+  return allPeersLocked && allResonanceGood;
+}
+
+void reportHarmonyStatus() {
+  String status = "HARMONY:";
+  status += harmonyStatus.isHarmonized ? "LOCKED:" : "UNLOCKED:";
+  status += String(harmonyStatus.harmonizationLevel) + ":";
+  status += String(harmonyStatus.activeNodes) + "/3";
+  
+  Serial.println(status);
+  
+  // Report tuning instructions for each LC tank
+  for (int i = 0; i < 4; i++) {
+    int peerIndex = lcTanks[i].peerIndex;
+    String peerName = NODE_NAMES[peers[peerIndex].peerId];
+    String tankType = lcTanks[i].isHighSide ? "HIGH" : "LOW";
+    
+    String instruction = getLCTankTuningInstruction(i);
+    
+    Serial.print("TUNE:");
+    Serial.print(peerName);
+    Serial.print(":");
+    Serial.print(tankType);
+    Serial.print(":");
+    Serial.println(instruction);
+  }
+}
+
+String getLCTankTuningInstruction(uint8_t tankIndex) {
+  if (tankIndex >= 4) return "ERROR";
+  
+  LCTankTuning& tank = lcTanks[tankIndex];
+  
+  // If resonance quality is excellent, no change needed
+  if (tank.resonanceQuality >= 0.9) {
+    return "OPTIMAL";
+  }
+  
+  // Determine tuning direction based on quality trend
+  String instruction;
+  
+  if (tank.tuningDirection > 0) {
+    instruction = "INCREASE";
+  } else if (tank.tuningDirection < 0) {
+    instruction = "DECREASE";
+  } else {
+    // Try suggesting a direction if we don't have one
+    // This would normally involve tracking quality changes over time
+    // For a simple version, we'll alternate suggestions
+    static uint8_t altSuggestion = 0;
+    altSuggestion = (altSuggestion + 1) % 2;
+    instruction = altSuggestion ? "INCREASE" : "DECREASE";
+  }
+  
+  // Add quality indication
+  if (tank.resonanceQuality < 0.3) {
+    instruction += " SIGNIFICANTLY";
+  } else if (tank.resonanceQuality < 0.7) {
+    instruction += " SLIGHTLY";
+  }
+  
+  return instruction;
+}
+
+void evaluateLCTanks() {
+  // For each LC tank, determine if tuning should be adjusted
+  for (int i = 0; i < 4; i++) {
+    LCTankTuning& tank = lcTanks[i];
+    uint8_t peerIndex = tank.peerIndex;
+    
+    // If we haven't heard from this peer recently, skip
+    if (millis() - peers[peerIndex].lastSeenTs > 10000) {
+      continue;
+    }
+    
+    // Track the last tuning direction
+    static float lastQuality[4] = {0.0, 0.0, 0.0, 0.0};
+    
+    // If enough time has passed since last adjustment evaluation
+    if (millis() - tank.lastAdjustmentTs > 5000) {
+      // Check if quality has improved or worsened
+      if (tank.resonanceQuality > lastQuality[i] + 0.1) {
+        // Quality improved - keep going in same direction
+        // No change to tuningDirection
+      } else if (tank.resonanceQuality < lastQuality[i] - 0.1) {
+        // Quality worsened - reverse direction
+        tank.tuningDirection = -tank.tuningDirection;
+      } else {
+        // Quality unchanged - try a different direction
+        tank.tuningDirection = (tank.tuningDirection == 0) ? 1 : -tank.tuningDirection;
+      }
+      
+      // Record quality for next comparison
+      lastQuality[i] = tank.resonanceQuality;
+      tank.lastAdjustmentTs = millis();
+    }
+  }
+}
+
+// Function to be called from the sync message handler
+void processPeerSync(uint8_t peerId, int8_t rssi, int32_t clockDelta, uint8_t status) {
+  updatePeerPhase(peerId, rssi, clockDelta);
+  
+  // If peer reports it's in harmony too, count it
+  if (status == 1) {  // Assuming status 1 means peer reports harmony
+    for (int i = 0; i < 2; i++) {
+      if (peers[i].peerId == peerId) {
+        peers[i].isLocked = true;
+        break;
+      }
+    }
+  }
+}
+
+// Function to be called from main loop to regularly update status
+void updateLCTankStatus() {
+  updateTuningTone();
+  updateLEDStatus();
+  
+  // Regularly report harmony status (once per minute)
+  static uint32_t lastStatusReport = 0;
+  if (millis() - lastStatusReport > 60000) {  // Every minute
+    reportHarmonyStatus();
+    lastStatusReport = millis();
+  }
+}
+
+// LC Tank value lookup table for Smart 451 CAN and ESP32 node frequencies
+//
+// This table provides common LC tank values for different frequencies
+// relevant to the Smart 451 CAN bus and ESP32 node communication
+//
+// Frequency   | Inductor (nH) | Capacitor (pF) | Notes
+// ------------|---------------|----------------|-------
+// 100 kHz     | 2200          | 1000           | Low frequency CAN data
+// 500 kHz     | 1000          | 100            | Standard CAN bus rate
+// 1 MHz       | 470           | 47             | High speed CAN
+// 8 MHz       | 100           | 22             | MCU clock harmonics
+// 16 MHz      | 68            | 10             | ESP32 crystal freq
+// 2.4 GHz     | 8.2           | 0.5            | ESP-NOW/WiFi (high tank)
+// 2.4 GHz     | 3.9           | 1.0            | ESP-NOW/WiFi (low tank)
